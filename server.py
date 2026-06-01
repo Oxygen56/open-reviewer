@@ -14,7 +14,7 @@ import json
 import logging
 import os
 import time
-import traceback
+import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -24,10 +24,14 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
 from agent import run_review
+from auth import require_auth
 from context_engine import prioritize_diff
+from cost import ReviewCost, start_tracking, stop_tracking, estimate_monthly_cost
 from github_client import GitHubClient
 from observability import metrics, tracer
 from pipeline import run_pipeline
+from ratelimit import RateLimitExceeded, check_and_acquire, release_review_slot, get_status as rate_limit_status
+from store import JobStore, JobRecord, store as job_store
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -63,10 +67,6 @@ SKILL_PATH = os.environ.get(
 _jobs: dict[str, dict[str, Any]] = {}
 
 
-def _job_id(owner: str, repo: str, pr_number: int) -> str:
-    return f"{owner}/{repo}/pull/{pr_number}"
-
-
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -75,8 +75,10 @@ def _job_id(owner: str, repo: str, pr_number: int) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("Open Reviewer starting up")
+    job_store.init()
     yield
     log.info("Open Reviewer shutting down")
+    job_store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -148,26 +150,46 @@ async def process_review(
     repo: str,
     pr_number: int,
     *,
+    head_sha: str = "",
     use_pipeline: bool = True,
 ) -> dict[str, Any]:
     """Run the full review pipeline for a PR.
 
-    Steps
-    -----
-    1. Fetch the unified diff via GitHub API.
-    2. Apply context engineering (prioritize security files, collapse boilerplate).
-    3. Run multi-agent pipeline: Review → Verify (ADR 004).
-    4. Post review comments and summary back to the PR.
-    5. Record metrics for observability.
+    Production flow:
+    1. Rate limit check (cooldown + concurrency)
+    2. Idempotency check via SQLite (same SHA already reviewed?)
+    3. Fetch diff, apply context engineering
+    4. Multi-agent pipeline: Review → Verify
+    5. Cost tracking per review
+    6. Persist to SQLite job store
+    7. Post comments, release rate limit slot
     """
-    jid = _job_id(owner, repo, pr_number)
-    _jobs[jid] = {"status": "running", "result": None}
-    trace_id = jid
-    start_time = time.time()
+    jid = f"{owner}/{repo}/pull/{pr_number}"
 
-    with tracer.trace(trace_id):
-        try:
+    # Rate limit check
+    try:
+        await check_and_acquire(owner, repo, pr_number)
+    except RateLimitExceeded as e:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(e))
+
+    # Start cost tracking
+    cost_tracker = start_tracking(jid)
+
+    # Persist job
+    try:
+        job_store.create_job(owner, repo, pr_number, head_sha=head_sha)
+    except ValueError:
+        release_review_slot()
+        return {"status": "skipped", "reason": "SHA already reviewed (idempotency)"}
+
+    job_store.update_job(jid, status="running")
+    trace_id = str(uuid.uuid4())
+
+    try:
+        with tracer.trace(trace_id):
             async with GitHubClient(token=GITHUB_TOKEN) as gh:
+                cost_tracker.github_api_calls += 1
+
                 # 1. Fetch diff
                 with tracer.span("fetch_diff") as span:
                     diff_text = await gh.fetch_diff(owner, repo, pr_number)
@@ -178,7 +200,7 @@ async def process_review(
                             detail="PR diff is empty — nothing to review",
                         )
 
-                # 2. Run review pipeline
+                # 2. Context engineering + review pipeline
                 pipeline_result = await run_pipeline(
                     diff_text=diff_text,
                     skill_path=SKILL_PATH,
@@ -195,55 +217,69 @@ async def process_review(
                     "pipeline_metadata": pipeline_result.pipeline_metadata,
                 }
 
-                # 3. Validate structured output
+                # Estimate tokens (SDK doesn't expose exact counts yet)
+                estimated_tokens = len(diff_text) // 4 + len(str(review_result)) // 4
+                cost_tracker.add_tokens(
+                    input_tokens=estimated_tokens,
+                    output_tokens=len(str(review_result)) // 4,
+                    duration_ms=pipeline_result.pipeline_metadata.get("total_duration", 0) * 1000,
+                )
+
                 _validate_review_result(review_result)
 
-                # 4. Post comments
+                # 3. Post comments
                 with tracer.span("post_comments") as span:
                     for finding in review_result.get("findings", []):
                         try:
                             await gh.post_review_comment(
-                                owner=owner,
-                                repo=repo,
-                                pr_number=pr_number,
+                                owner=owner, repo=repo, pr_number=pr_number,
                                 body=f"**{finding.get('severity', 'info').upper()}**: {finding.get('message', '')}",
                                 commit_id=finding.get("commit_id"),
-                                path=finding.get("path"),
-                                line=finding.get("line"),
+                                path=finding.get("path"), line=finding.get("line"),
                             )
                         except Exception as exc:
-                            log.warning("Failed to post individual finding: %s", exc)
+                            log.warning("Failed to post finding: %s", exc)
 
                     summary_body = _build_summary_body(review_result)
                     await gh.post_pr_comment(
-                        owner=owner,
-                        repo=repo,
-                        pr_number=pr_number,
-                        body=summary_body,
+                        owner=owner, repo=repo, pr_number=pr_number, body=summary_body,
                     )
+                    cost_tracker.github_api_calls += len(review_result.get("findings", [])) + 1
                     span.set_attribute("comments.posted", len(review_result.get("findings", [])) + 1)
 
+                # 4. Persist
+                job_store.update_job(
+                    jid, status="completed", result=review_result,
+                    cost_tokens=cost_tracker.total_tokens,
+                    cost_dollars=cost_tracker.total_cost,
+                )
+                if head_sha:
+                    job_store.save_review_history(
+                        owner, repo, pr_number, head_sha, review_result,
+                    )
+
                 # 5. Record metrics
-                duration_ms = (time.time() - start_time) * 1000
+                duration_ms = (time.time() - cost_tracker.started_at) * 1000
                 metrics.record_review(
                     duration_ms=duration_ms,
-                    stage_timings=pipeline_result.pipeline_metadata.get(
-                        "stage_timings", {},
-                    ),
+                    stage_timings=pipeline_result.pipeline_metadata.get("stage_timings", {}),
                     finding_count=len(pipeline_result.findings),
                     success=True,
                 )
 
-            _jobs[jid] = {"status": "completed", "result": review_result}
-            return review_result
+        return review_result
 
-        except HTTPException:
-            metrics.record_review(0, {}, 0, success=False)
-            raise
-        except Exception as exc:
-            metrics.record_review(0, {}, 0, success=False)
-            _jobs[jid] = {"status": "failed", "error": str(exc)}
-            raise
+    except HTTPException:
+        job_store.update_job(jid, status="failed", error="HTTP error")
+        metrics.record_review(0, {}, 0, success=False)
+        raise
+    except Exception as exc:
+        job_store.update_job(jid, status="failed", error=str(exc))
+        metrics.record_review(0, {}, 0, success=False)
+        raise
+    finally:
+        stop_tracking(jid)
+        await release_review_slot()
 
 
 def _validate_review_result(result: dict[str, Any]) -> None:
@@ -387,6 +423,50 @@ async def list_reviews():
 async def get_metrics():
     """Observability: pipeline performance metrics."""
     return metrics.summary()
+
+
+@app.get("/admin/stats")
+@require_auth
+async def admin_stats():
+    """Protected: aggregate job statistics from SQLite store."""
+    return job_store.get_stats()
+
+
+@app.get("/admin/jobs")
+@require_auth
+async def admin_jobs(status: str | None = None):
+    """Protected: list recent jobs."""
+    return {"jobs": [r.__dict__ for r in job_store.list_jobs(status=status)]}
+
+
+@app.get("/admin/ratelimits")
+@require_auth
+async def admin_ratelimits():
+    """Protected: current rate limit status."""
+    return rate_limit_status()
+
+
+@app.get("/admin/costs")
+@require_auth
+async def admin_costs():
+    """Protected: cost summary."""
+    stats = job_store.get_stats()
+    return {
+        "total_cost_dollars": stats["total_cost_dollars"],
+        "total_tokens": stats["total_tokens"],
+        "estimated_monthly": estimate_monthly_cost(),
+    }
+
+
+@app.get("/admin/jobs/{jid}")
+@require_auth
+async def admin_job_detail(jid: str):
+    """Protected: single job detail."""
+    try:
+        job = job_store.get_job(jid)
+        return job.__dict__
+    except KeyError:
+        raise HTTPException(status_code=404, detail="Job not found")
 
 
 # ---------------------------------------------------------------------------

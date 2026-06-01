@@ -5,23 +5,21 @@ AI code review agent service. Receives GitHub webhook events (PR opened / synchr
 ## Architecture
 
 ```
-GitHub Webhook → FastAPI → Context Engine → Multi-Agent Pipeline → GitHub Comments
-                                    │                      │
-                                    ▼                      ▼
-                            prioritize_diff()    Reviewer → Verifier → Summarizer
-                            (security-first)      (ADR 004 adversarial verify)
+GitHub Webhook → Rate Limiter → Store (SQLite) → Context Engine → Pipeline → GitHub Comments
+                    │              │                   │              │
+                    ▼              ▼                   ▼              ▼
+              Per-PR cooldown  Idempotency      prioritize_diff()  Reviewer→Verifier
+              Concurrency cap  SHA-based dedup  Security-first     (adversarial)
 ```
 
-| Module | Role | Interview Talking Point |
-|--------|------|------------------------|
-| `pipeline.py` | Multi-agent orchestration | Adversarial verification removes ~40% false positives |
-| `context_engine.py` | Diff prioritization | Security files always get full context, boilerplate collapsed |
-| `observability.py` | Structured logging + tracing | OpenTelemetry-compatible, P50/P99 pipeline latency |
-| `agent.py` | Claude Agent SDK integration | Stateless agent per ADR 001 |
-| `github_client.py` | GitHub REST API | Async HTTP with retry logic |
-| `evaluation/` | Gold set testing | Known bugs injected to measure recall/precision/F1 |
-| `adr/` | Architecture decisions | 5 ADRs documenting every key choice |
-| `server.py` | FastAPI webhook receiver | HMAC signature validation, fire-and-forget (ADR 002) |
+| Tier | Modules | Interview Talking Point |
+|------|---------|------------------------|
+| **Agent Intelligence** | `pipeline.py`, `context_engine.py`, `agent.py` | Multi-agent adversarial verification, 4-tier context budget |
+| **Production Ops** | `store.py`, `ratelimit.py`, `cost.py`, `auth.py` | SQLite persistence (zero infra), per-repo cooldown, token cost tracking, API auth |
+| **Observability** | `observability.py` | OpenTelemetry tracing, P50/P99 latency, structured JSON logs |
+| **Quality Assurance** | `evaluation/` | Gold set testing with real OSS bugs, recall/precision/F1 |
+| **Design Docs** | `adr/` | 5 Architecture Decision Records with trade-off analysis |
+| **Deployment** | `Dockerfile`, `fly.toml`, `deploy.sh` | One-command deploy to fly.io |
 
 ## Quick Start
 

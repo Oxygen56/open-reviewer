@@ -29,7 +29,7 @@ COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy application code
-COPY server.py agent.py github_client.py context_engine.py pipeline.py observability.py ./
+COPY server.py agent.py github_client.py context_engine.py pipeline.py observability.py store.py cost.py ratelimit.py auth.py ./
 COPY evaluation/ ./evaluation/
 COPY tests/ ./tests/
 
