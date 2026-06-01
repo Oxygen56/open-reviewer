@@ -1,0 +1,20 @@
+diff --git a/flashinfer/prefill.py b/flashinfer/prefill.py
+index abc123..def456 100644
+--- a/flashinfer/prefill.py
++++ b/flashinfer/prefill.py
+@@ -1275,10 +1275,12 @@ def single_prefill_with_kv_cache(
+         # Convert custom_mask to packed_custom_mask if needed
+         if custom_mask is not None and packed_custom_mask is None:
++            # NOTE: custom_mask must have shape (qo_len, kv_len)
++            if custom_mask.shape != (q.size(0), kv_len_expected):
++                raise ValueError(
++                    f"custom_mask must have shape ({q.size(0)}, {kv_len_expected}), "
++                    f"but got {custom_mask.shape}"
++                )
+             packed_custom_mask = packbits(
+                 custom_mask.contiguous().view(-1), bitorder="little"
+             )
+-            # Missing: shape validation before packbits.
+-            # A shape-mismatched custom_mask passes .view(-1) silently
+-            # and produces a corrupted packed mask, causing silent GPU
+-            # memory corruption in the CUDA kernel.

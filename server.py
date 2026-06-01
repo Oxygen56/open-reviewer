@@ -13,6 +13,7 @@ import hmac
 import json
 import logging
 import os
+import time
 import traceback
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -23,7 +24,10 @@ from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
 from agent import run_review
+from context_engine import prioritize_diff
 from github_client import GitHubClient
+from observability import metrics, tracer
+from pipeline import run_pipeline
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -139,78 +143,107 @@ def parse_payload(payload: dict[str, Any]) -> PREvent | None:
     )
 
 
-async def process_review(owner: str, repo: str, pr_number: int) -> dict[str, Any]:
+async def process_review(
+    owner: str,
+    repo: str,
+    pr_number: int,
+    *,
+    use_pipeline: bool = True,
+) -> dict[str, Any]:
     """Run the full review pipeline for a PR.
 
     Steps
     -----
     1. Fetch the unified diff via GitHub API.
-    2. Run the Claude Code agent with the oss-pr-reviewer skill.
-    3. Parse the structured JSON output.
+    2. Apply context engineering (prioritize security files, collapse boilerplate).
+    3. Run multi-agent pipeline: Review → Verify (ADR 004).
     4. Post review comments and summary back to the PR.
+    5. Record metrics for observability.
     """
     jid = _job_id(owner, repo, pr_number)
     _jobs[jid] = {"status": "running", "result": None}
-    log.info("Starting review for %s", jid)
+    trace_id = jid
+    start_time = time.time()
 
-    try:
-        async with GitHubClient(token=GITHUB_TOKEN) as gh:
-            # 1. Fetch diff
-            log.info("Fetching diff for %s", jid)
-            diff_text = await gh.fetch_diff(owner, repo, pr_number)
-            if not diff_text.strip():
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="PR diff is empty — nothing to review",
+    with tracer.trace(trace_id):
+        try:
+            async with GitHubClient(token=GITHUB_TOKEN) as gh:
+                # 1. Fetch diff
+                with tracer.span("fetch_diff") as span:
+                    diff_text = await gh.fetch_diff(owner, repo, pr_number)
+                    span.set_attribute("diff.chars", len(diff_text))
+                    if not diff_text.strip():
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="PR diff is empty — nothing to review",
+                        )
+
+                # 2. Run review pipeline
+                pipeline_result = await run_pipeline(
+                    diff_text=diff_text,
+                    skill_path=SKILL_PATH,
+                    owner=owner,
+                    repo=repo,
+                    pr_number=pr_number,
+                    stages=["review", "verify"] if use_pipeline else ["review"],
                 )
 
-            # 2. Run review via Claude Code agent
-            log.info("Running Claude Code review for %s (diff size: %d bytes)", jid, len(diff_text))
-            review_result = await run_review(
-                diff_text=diff_text,
-                skill_path=SKILL_PATH,
-                owner=owner,
-                repo=repo,
-                pr_number=pr_number,
-            )
+                review_result = {
+                    "summary": pipeline_result.summary,
+                    "findings": pipeline_result.findings,
+                    "mergeability_score": pipeline_result.mergeability_score,
+                    "pipeline_metadata": pipeline_result.pipeline_metadata,
+                }
 
-            # 3. Validate structured output
-            _validate_review_result(review_result)
+                # 3. Validate structured output
+                _validate_review_result(review_result)
 
-            # 4. Post comments
-            log.info("Posting review results for %s", jid)
-            for finding in review_result.get("findings", []):
-                try:
-                    await gh.post_review_comment(
+                # 4. Post comments
+                with tracer.span("post_comments") as span:
+                    for finding in review_result.get("findings", []):
+                        try:
+                            await gh.post_review_comment(
+                                owner=owner,
+                                repo=repo,
+                                pr_number=pr_number,
+                                body=f"**{finding.get('severity', 'info').upper()}**: {finding.get('message', '')}",
+                                commit_id=finding.get("commit_id"),
+                                path=finding.get("path"),
+                                line=finding.get("line"),
+                            )
+                        except Exception as exc:
+                            log.warning("Failed to post individual finding: %s", exc)
+
+                    summary_body = _build_summary_body(review_result)
+                    await gh.post_pr_comment(
                         owner=owner,
                         repo=repo,
                         pr_number=pr_number,
-                        body=f"**{finding.get('severity', 'info').upper()}**: {finding.get('message', '')}",
-                        commit_id=finding.get("commit_id"),
-                        path=finding.get("path"),
-                        line=finding.get("line"),
+                        body=summary_body,
                     )
-                except Exception as exc:
-                    log.warning("Failed to post individual finding: %s", exc)
+                    span.set_attribute("comments.posted", len(review_result.get("findings", [])) + 1)
 
-            summary_body = _build_summary_body(review_result)
-            await gh.post_pr_comment(
-                owner=owner,
-                repo=repo,
-                pr_number=pr_number,
-                body=summary_body,
-            )
+                # 5. Record metrics
+                duration_ms = (time.time() - start_time) * 1000
+                metrics.record_review(
+                    duration_ms=duration_ms,
+                    stage_timings=pipeline_result.pipeline_metadata.get(
+                        "stage_timings", {},
+                    ),
+                    finding_count=len(pipeline_result.findings),
+                    success=True,
+                )
 
-        _jobs[jid] = {"status": "completed", "result": review_result}
-        log.info("Review completed for %s", jid)
-        return review_result
+            _jobs[jid] = {"status": "completed", "result": review_result}
+            return review_result
 
-    except HTTPException:
-        raise
-    except Exception as exc:
-        log.exception("Review failed for %s", jid)
-        _jobs[jid] = {"status": "failed", "error": str(exc)}
-        raise
+        except HTTPException:
+            metrics.record_review(0, {}, 0, success=False)
+            raise
+        except Exception as exc:
+            metrics.record_review(0, {}, 0, success=False)
+            _jobs[jid] = {"status": "failed", "error": str(exc)}
+            raise
 
 
 def _validate_review_result(result: dict[str, Any]) -> None:
@@ -348,6 +381,12 @@ async def review_status(owner: str, repo: str, pr_number: int):
 async def list_reviews():
     """List all tracked review jobs (in-memory; limited to this process)."""
     return {"reviews": _jobs}
+
+
+@app.get("/metrics")
+async def get_metrics():
+    """Observability: pipeline performance metrics."""
+    return metrics.summary()
 
 
 # ---------------------------------------------------------------------------

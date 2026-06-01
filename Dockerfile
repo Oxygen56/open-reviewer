@@ -29,7 +29,8 @@ COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/pytho
 COPY --from=builder /usr/local/bin /usr/local/bin
 
 # Copy application code
-COPY server.py agent.py github_client.py ./
+COPY server.py agent.py github_client.py context_engine.py pipeline.py observability.py ./
+COPY evaluation/ ./evaluation/
 COPY tests/ ./tests/
 
 # The oss-pr-reviewer skill must be mounted at /app/oss-pr-reviewer

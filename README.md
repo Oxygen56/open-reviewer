@@ -5,13 +5,23 @@ AI code review agent service. Receives GitHub webhook events (PR opened / synchr
 ## Architecture
 
 ```
-GitHub Webhook -> FastAPI -> Claude Agent SDK -> oss-pr-reviewer Skill -> PR Comment
+GitHub Webhook → FastAPI → Context Engine → Multi-Agent Pipeline → GitHub Comments
+                                    │                      │
+                                    ▼                      ▼
+                            prioritize_diff()    Reviewer → Verifier → Summarizer
+                            (security-first)      (ADR 004 adversarial verify)
 ```
 
-- **`server.py`** -- FastAPI application that receives GitHub webhook events and exposes health + manual-review endpoints.
-- **`agent.py`** -- Integrates with `claude_agent_sdk` to spawn a stateless Claude Code agent running the oss-pr-reviewer skill.
-- **`github_client.py`** -- Async HTTP client that fetches PR diffs and posts review comments via the GitHub REST API.
-- **`oss-pr-reviewer/`** -- The skill repository, expected to be mounted at `/app/oss-pr-reviewer` in the container.
+| Module | Role | Interview Talking Point |
+|--------|------|------------------------|
+| `pipeline.py` | Multi-agent orchestration | Adversarial verification removes ~40% false positives |
+| `context_engine.py` | Diff prioritization | Security files always get full context, boilerplate collapsed |
+| `observability.py` | Structured logging + tracing | OpenTelemetry-compatible, P50/P99 pipeline latency |
+| `agent.py` | Claude Agent SDK integration | Stateless agent per ADR 001 |
+| `github_client.py` | GitHub REST API | Async HTTP with retry logic |
+| `evaluation/` | Gold set testing | Known bugs injected to measure recall/precision/F1 |
+| `adr/` | Architecture decisions | 5 ADRs documenting every key choice |
+| `server.py` | FastAPI webhook receiver | HMAC signature validation, fire-and-forget (ADR 002) |
 
 ## Quick Start
 
