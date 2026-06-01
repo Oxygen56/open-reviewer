@@ -33,9 +33,8 @@ COPY server.py agent.py github_client.py context_engine.py pipeline.py observabi
 COPY evaluation/ ./evaluation/
 COPY tests/ ./tests/
 
-# The oss-pr-reviewer skill must be mounted at /app/oss-pr-reviewer
-# Set SKILL_PATH env var (default matches mount point)
-ENV SKILL_PATH=/app/oss-pr-reviewer
+# Bundle the oss-pr-reviewer skill directly in the image
+COPY oss-pr-reviewer/ ./oss-pr-reviewer/
 
 # Expose FastAPI port
 EXPOSE 8000
